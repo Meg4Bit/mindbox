@@ -1,0 +1,140 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  replicas: 4 # Стартуем с максимальным нужным числом подов
+  strategy:
+    type: Recreate # Восстанавливаем, если упал
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: k8s.gcr.io/nginx-slim:0.8 # Nginx используется для примера вместо веб-приложения
+        imagePullPolicy: Always
+        resources:
+          requests: # Показатели при нормальной работе
+            memory: "128M"
+            cpu: "100m"
+          limits: # Показатели при повышенной нагрузке
+            memory: "128M"
+            cpu: "500m"
+        ports:
+        - containerPort: 80
+      initContainers: # Запускаем, чтобы проверить готовность БД перед стартом приложения
+      - name: init-myservice
+        image: willwill/wait-for-it
+        args: [mysql:3306 -- echo "MySQL is up"]
+---
+apiVersion: v1
+kind: Service # Создаем сервис для приложения
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  selector:
+    app: nginx
+  ports:
+  - protocol: TCP
+    name: http
+    port: 80
+    targetPort: 80
+  type: LoadBalancer # Делаем доступным из вне
+---
+apiVersion: v1
+kind: Service # Создаем сервис для БД
+metadata:
+  name: mysql
+  labels:
+    app: mysql
+spec:
+  ports:
+    - port: 3306 # Открываем порт
+  selector:
+    app: mysql
+  clusterIP: None
+---
+apiVersion: v1
+kind: PersistentVolumeClaim # Создаем локальное хранилище для данных из БД на случай, если поды упадут
+metadata:
+  name: mysql-pvc
+  labels:
+    app: mysql
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Secret # Задаем пароль для БД
+metadata:
+  name: mysql-pass
+stringData:
+  password: password
+---
+apiVersion: apps/v1
+kind: StatefulSet # Используем постоянные поды для бд. Делаем 2 реплики на случай, если одна упадет, но сервис продолжал работать
+metadata:
+  name: mysql
+  labels:
+    app: mysql
+spec:
+  serviceName: mysql
+  selector:
+    matchLabels:
+      app: mysql
+  replicas: 2
+  minReadySeconds: 10
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - image: mysql:5.7
+        name: mysql
+        env:
+        - name: MYSQL_DATABASE
+          value: mindbox
+        - name: MYSQL_USER
+          value: mysql
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-pass
+              key: password
+        - name: MYSQL_ALLOW_EMPTY_PASSWORD
+          value: "yes"
+        ports:
+        - containerPort: 3306
+        volumeMounts:
+        - name: mysql-persistent-storage
+          mountPath: /var/lib/mysql
+      volumes:
+      - name: mysql-persistent-storage # Связываем с хранилищем
+        persistentVolumeClaim:
+          claimName: mysql-pvc
+---
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler # Используем, чтобы при маленькой нагрузке на сервис работало меньшее количество подов, и наоброт при большей нагрузке поднимались дополниетльные поды.
+metadata: # Это позволит днем имеет максимальное количество подов, а ночью минимальное
+  name: nginx
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nginx
+  minReplicas: 1
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 100
